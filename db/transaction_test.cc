@@ -13,6 +13,9 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <random>
+#include <chrono>
+#include <sstream>
 
 namespace leveldb {
 
@@ -141,6 +144,95 @@ TEST_F(TransactionTest, ConcurrentTransactionsSingleKey) {
   // The final value should be one of the committed values (not NOT_FOUND).
   std::string val = Get("concurrent_key");
   ASSERT_NE(val, "NOT_FOUND");
+}
+
+TEST_F(TransactionTest, ConcurrentMultiKeyTransfers) {
+  // Initialize multiple counters
+  const int kKeys = 4;
+  const int kInitial = 1000;
+  const int kThreads = 8;
+  const int kIterations = 200;
+
+  std::vector<std::string> keys;
+  int64_t expected_total = 0;
+  for (int i = 0; i < kKeys; ++i) {
+    keys.push_back("acct_" + std::to_string(i));
+    Put(keys.back(), std::to_string(kInitial));
+    expected_total += kInitial;
+  }
+
+  std::atomic<int> committed_count{0};
+
+  auto worker = [&](int seed) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> dist_key(0, kKeys - 1);
+
+    for (int it = 0; it < kIterations; ++it) {
+      int a = dist_key(rng);
+      int b = dist_key(rng);
+      if (a == b) continue;
+
+      Transaction txn(db());
+      std::string va, vb;
+      Status sa = txn.Get(ReadOptions(), keys[a], &va);
+      Status sb = txn.Get(ReadOptions(), keys[b], &vb);
+      if (!sa.ok() || !sb.ok()) {
+        txn.Abort();
+        continue;
+      }
+
+      int ia = 0, ib = 0;
+      try {
+        ia = std::stoi(va);
+        ib = std::stoi(vb);
+      } catch (...) {
+        txn.Abort();
+        continue;
+      }
+
+      // Transfer 1 unit from a -> b if available
+      if (ia >= 1) {
+        txn.Put(keys[a], std::to_string(ia - 1));
+        txn.Put(keys[b], std::to_string(ib + 1));
+      } else {
+        // nothing to do
+        txn.Abort();
+        continue;
+      }
+
+      if (txn.Commit().ok()) {
+        committed_count.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    // Seed with time + t to diversify
+    int seed = static_cast<int>(std::chrono::high_resolution_clock::now().time_since_epoch().count() + t);
+    threads.emplace_back(worker, seed);
+  }
+
+  for (auto& th : threads) th.join();
+
+  // Verify total remains the same and no account is negative
+  int64_t final_total = 0;
+  for (const auto& k : keys) {
+    std::string v = Get(k);
+    ASSERT_NE(v, "NOT_FOUND");
+    int64_t iv = 0;
+    try {
+      iv = std::stoll(v);
+    } catch (...) {
+      FAIL() << "Invalid integer value for key " << k << ": " << v;
+    }
+    ASSERT_GE(iv, 0);
+    final_total += iv;
+  }
+
+  ASSERT_EQ(final_total, expected_total);
+  // Ensure some commits happened
+  ASSERT_GT(committed_count.load(std::memory_order_relaxed), 0);
 }
 
 }  // namespace leveldb
